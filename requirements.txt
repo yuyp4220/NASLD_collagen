@@ -1,0 +1,11 @@
+numpy
+pandas
+opencv-python
+matplotlib
+scikit-image
+scikit-learn
+tifffile
+joblib
+tqdm
+openslide-python
+pyvips

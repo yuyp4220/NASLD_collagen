@@ -1,0 +1,50 @@
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.joblib
+
+# === macOS system files ===
+.DS_Store
+
+# === Jupyter Notebook Checkpoints ===
+.ipynb_checkpoints/
+
+# === VSCode settings (optional) ===
+.vscode/
+
+# === Common image outputs ===
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.bmp
+*.gif
+*.pdf
+*.svg
+
+# === Temporary/output folders (adjust if needed) ===
+output/
+outputs/
+results/
+figures/
+feature_jsons/
+feature_jsons_simplified/
+data/
+datasets/
+
+# === Logs and temp files ===
+*.log
+*.tmp
+*.bak
+
+# === Virtual environments ===
+venv/
+.env/
+env/
+.shared_env/
+*.env
