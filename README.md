@@ -6,7 +6,6 @@ This repository contains the code for quantifying collagen features from histolo
 
 - `core/`: contains all function definitions
 - `main.py`: batch process multiple slides and export CSV
-- `visualize.py`: view individual tile results (optional)
 - `.gitignore`: excludes large or sensitive data
 - `README.md`: this file
 
