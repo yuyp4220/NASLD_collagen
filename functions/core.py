@@ -55,7 +55,7 @@ def fast_lab_spread_from_hsv(h, s, v):
     return float(np.linalg.norm(q75 - q25))
 
 
-def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.1, spread_thresh=10):
+def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.01, spread_thresh=10):
     hue_all = []
     s_all = []
     v_all = []
@@ -93,18 +93,15 @@ def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.1, spre
     s_ds = s_all[indices]
     v_ds = v_all[indices]
 
-
-    
-    hist, bin_edges = np.histogram(hue_ds, bins=180, range=(0, 180))
-    top3_indices = np.argsort(hist)[-3:]  
-    top3_hues = [(bin_edges[i] + bin_edges[i + 1]) / 2 for i in top3_indices]
-
-    
-    red_count = sum((hue < 10 or hue > 160) for hue in top3_hues)
-
-    
-    k = 3 if red_count >= 2 else 5
-    print(f"Top3 hue centers: {[f'{h:.1f}' for h in top3_hues]}, red count = {red_count}, using K={k}")
+    # 新增 dominant color 判斷邏輯
+    yellow_mask = (hue_ds >= 15) & (hue_ds <= 40)
+    yellow_ratio = np.sum(yellow_mask) / len(hue_ds)
+    if yellow_ratio > 0.05:
+        print(f"Yellow-dominant slide: {yellow_ratio:.2%} of pixels in 15–40 hue range → using K=5")
+        k = 5
+    else:
+        print(f"Red-dominant slide: {yellow_ratio:.2%} of pixels in 15–40 hue range → using K=3")
+        k = 3
 
     kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
     hue_labels = kmeans.fit_predict(hue_ds.reshape(-1, 1))
