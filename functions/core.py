@@ -16,6 +16,31 @@ from skimage.morphology import (
 from sklearn.cluster import KMeans, DBSCAN
 
 
+def load_image(image_path):
+    image = cv2.imread(image_path)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    return image, gray
+
+def get_otsu_mask(original_img,gray_img):
+    threshold = filters.threshold_otsu(gray_img)
+    mask = gray_img < threshold
+
+    
+    foreground = original_img.copy()
+    if mask.shape != original_img.shape[:2]:
+        raise ValueError("Mask and image shape mismatch at Otsu")
+    foreground[~mask] = 255
+    mask = (gray_img < threshold).astype(np.uint8)
+    # plt.figure(figsize=(10, 4))
+    # plt.imshow(mask, cmap='gray')
+    # plt.title("Otsu Mask")
+    # plt.axis('off')
+    # plt.show()
+
+    return mask, foreground
+
+
 def efficient_histogram_downsample(data, max_total=10000, return_indices=False):
     data = data.flatten()
     hist, bin_edges = np.histogram(data, bins=180, range=(0, 180))
@@ -55,7 +80,7 @@ def fast_lab_spread_from_hsv(h, s, v):
     return float(np.linalg.norm(q75 - q25))
 
 
-def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.01, spread_thresh=10):
+def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.001, spread_thresh=10):
     hue_all = []
     s_all = []
     v_all = []
@@ -93,16 +118,76 @@ def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.01, spr
     s_ds = s_all[indices]
     v_ds = v_all[indices]
 
-    # 新增 dominant color 判斷邏輯
     yellow_mask = (hue_ds >= 15) & (hue_ds <= 40)
     yellow_ratio = np.sum(yellow_mask) / len(hue_ds)
-    if yellow_ratio > 0.05:
-        print(f"Yellow-dominant slide: {yellow_ratio:.2%} of pixels in 15–40 hue range → using K=5")
-        k = 5
-    else:
-        print(f"Red-dominant slide: {yellow_ratio:.2%} of pixels in 15–40 hue range → using K=3")
-        k = 3
+    k = 5 if yellow_ratio > 0.05 else 3
+    print(f"{'Yellow' if k==5 else 'Red'}-dominant slide: {yellow_ratio:.2%} in 15–40 hue range → using K={k}")
 
+    if k == 3:
+        try:
+            # Step 1: H-S clustering
+            hs_data = np.stack([hue_ds, s_ds], axis=1)
+            kmeans_hs = KMeans(n_clusters=3, random_state=0, n_init=10)
+            hs_labels = kmeans_hs.fit_predict(hs_data)
+            hs_centers = kmeans_hs.cluster_centers_
+            hs_scores = hs_centers.sum(axis=1)
+            sorted_idx = np.argsort(hs_scores)
+
+            selected_label = sorted_idx[-1]
+            s_center = hs_centers[selected_label, 1]
+            mask_selected = hs_labels == selected_label
+            h_sel, s_sel, v_sel = hue_ds[mask_selected], s_ds[mask_selected], v_ds[mask_selected]
+
+            first_range = [
+                (int(h_sel.min()), int(h_sel.max())),
+                (int(s_sel.min()), int(s_sel.max())),
+                (int(v_sel.min()), int(v_sel.max()))
+            ]
+
+            print(f"🔍 Step 1: S center = {s_center:.1f}, entering second round clustering.")
+            hsv_selected = np.stack([h_sel, s_sel, v_sel], axis=1)
+            kmeans_hsv = KMeans(n_clusters=2, random_state=0, n_init=10)
+            hsv_labels = kmeans_hsv.fit_predict(hsv_selected)
+
+            # Step 2: RGB conversion for R-channel analysis
+            rgb_selected = cv2.cvtColor(
+                hsv_selected.astype(np.uint8).reshape(-1, 1, 3),
+                cv2.COLOR_HSV2RGB
+            ).reshape(-1, 3)
+            r_channel = rgb_selected[:, 0]
+
+            r_means = []
+            for label_id in [0, 1]:
+                r_cluster = r_channel[hsv_labels == label_id]
+                r_means.append(np.mean(r_cluster))
+
+            print(f"  → R means: {r_means[0]:.1f}, {r_means[1]:.1f}")
+
+            if r_means[0] > 180 and r_means[1] > 180:
+                print("✅ Both R means > 180 → use first round cluster range.")
+                return first_range, True
+            else:
+                target_label = 0 if r_means[0] > r_means[1] else 1
+                print(f"⚠️ Detected low-R cluster, using cluster {target_label} with higher R mean = {r_means[target_label]:.1f}")
+                group = hsv_selected[hsv_labels == target_label]
+                h_sel = group[:, 0]
+                s_sel = group[:, 1]
+                v_sel = group[:, 2]
+
+                hmin, hmax = int(h_sel.min()), int(h_sel.max())
+                smin, smax = int(s_sel.min()), int(s_sel.max())
+                vmin, vmax = int(v_sel.min()), int(v_sel.max())
+
+                selected_ranges = [(hmin, hmax), (smin, smax), (vmin, vmax)]
+                print(selected_ranges)
+                return selected_ranges, True
+
+        except Exception as e:
+            print("⚠️ HSV clustering failed, fallback to red logic with 2 hue ranges")
+            k = 5  # fallback
+            yellow_ratio = 1  # force fallback
+
+    # k == 5 or fallback
     kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
     hue_labels = kmeans.fit_predict(hue_ds.reshape(-1, 1))
     cluster_centers = kmeans.cluster_centers_.flatten()
@@ -116,109 +201,66 @@ def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.01, spr
         hue_ranges.append((hmin, hmax))
         print(f"Hue Cluster {new_id}: Mean = {mean_hue:.2f}, Range = [{hmin}, {hmax}]")
 
-    if k == 3:
-        selected_ids = [sorted_idx[-1]]
-        hsv_selected = []
-        for cid in selected_ids:
-            mask = (hue_labels == cid)
-            h_sel, s_sel, v_sel = hue_ds[mask], s_ds[mask], v_ds[mask]
-            hsv_selected.append(np.stack([h_sel, s_sel, v_sel], axis=1))
-        hsv_selected = np.concatenate(hsv_selected, axis=0)
-        k_hsv = 5
-        kmeans_hsv = KMeans(n_clusters=k_hsv, random_state=0, n_init=10)
-        hsv_labels = kmeans_hsv.fit_predict(hsv_selected)
-        center_scores = kmeans_hsv.cluster_centers_.sum(axis=1)
-        sorted_hsv_idx = np.argsort(center_scores)
-        label_remap = {old: new for new, old in enumerate(sorted_hsv_idx)}
-        labels_sorted = np.vectorize(label_remap.get)(hsv_labels)
-        target_label = k_hsv - 1
-        group = hsv_selected[labels_sorted == target_label]
-        hmin, hmax = int(group[:, 0].min()), int(group[:, 0].max())
-        smin, smax = int(group[:, 1].min()), int(group[:, 1].max())
-        vmin, vmax = int(group[:, 2].min()), int(group[:, 2].max())
-        print(f"Selected HSV Cluster {target_label} (H+S+V strongest):")
-        print(f"  H = [{hmin}, {hmax}], S = [{smin}, {smax}], V = [{vmin}, {vmax}]")
-        selected_ranges = [(hmin, hmax), (smin, smax), (vmin, vmax)]
-        return selected_ranges, True
+    hmin1, hmax1 = hue_ranges[0]
+    hmin2, hmax2 = hue_ranges[-1]
+    mask_combined = ((hue_ds >= hmin1) & (hue_ds <= hmax1)) | ((hue_ds >= hmin2) & (hue_ds <= hmax2))
+    h_sel = hue_ds[mask_combined]
+    s_sel = s_ds[mask_combined]
+    v_sel = v_ds[mask_combined]
+    spread = fast_lab_spread_from_hsv(h_sel, s_sel, v_sel)
+    print(f"Fast LAB spread = {spread:.2f}")
 
+    if spread < spread_thresh:
+        selected_ranges = [(hmin1, hmax1), (hmin2, hmax2)]
+        print("Spread < threshold, accept original hue ranges.")
+        return selected_ranges, False
     else:
-        hmin1, hmax1 = hue_ranges[0]
-        hmin2, hmax2 = hue_ranges[-1]
-        mask_combined = ((hue_ds >= hmin1) & (hue_ds <= hmax1)) | ((hue_ds >= hmin2) & (hue_ds <= hmax2))
-        h_sel = hue_ds[mask_combined]
-        s_sel = s_ds[mask_combined]
-        v_sel = v_ds[mask_combined]
-        spread = fast_lab_spread_from_hsv(h_sel, s_sel, v_sel)
-        print(f"Fast LAB spread = {spread:.2f}")
-        if spread < spread_thresh:
-            selected_ranges = [(hmin1, hmax1), (hmin2, hmax2)]
-            print("Spread < threshold, accept original hue ranges.")
-            return selected_ranges, False
-        else:
-            kmeans_ref = KMeans(n_clusters=5, random_state=42, n_init=10)
-            labels_ref = kmeans_ref.fit_predict(h_sel.reshape(-1, 1))
-            centers_ref = kmeans_ref.cluster_centers_.flatten()
-            sorted_ref = np.argsort(centers_ref)
-            hue_ranges_ref = []
-            for new_id, old_id in enumerate(sorted_ref):
-                cluster = h_sel[labels_ref == old_id]
-                if cluster.size == 0:
-                    continue
-                hue_ranges_ref.append((int(cluster.min()), int(cluster.max())))
-            final_ranges = [hue_ranges_ref[0], hue_ranges_ref[-1]]
-            print("Refined hue ranges due to high spread:")
-            for i, (hmin, hmax) in enumerate(final_ranges):
-                print(f"  Refined Hue Cluster {i}: H = [{hmin}, {hmax}]")
-            return final_ranges, False
+        kmeans_ref = KMeans(n_clusters=5, random_state=42, n_init=10)
+        labels_ref = kmeans_ref.fit_predict(h_sel.reshape(-1, 1))
+        centers_ref = kmeans_ref.cluster_centers_.flatten()
+        sorted_ref = np.argsort(centers_ref)
+        hue_ranges_ref = []
+        for new_id, old_id in enumerate(sorted_ref):
+            cluster = h_sel[labels_ref == old_id]
+            if cluster.size == 0:
+                continue
+            hue_ranges_ref.append((int(cluster.min()), int(cluster.max())))
+        final_ranges = [hue_ranges_ref[0], hue_ranges_ref[-1]]
+        print("Refined hue ranges due to high spread:")
+        for i, (hmin, hmax) in enumerate(final_ranges):
+            print(f"  Refined Hue Cluster {i}: H = [{hmin}, {hmax}]")
+        return final_ranges, False
 
     
     
-def generate_collagen_mask_direct_robust(foreground_bgr, selected_ranges, slide_is_red, s_thresh=0):
+def generate_collagen_mask_direct_robust(foreground_bgr, selected_ranges, slide_is_red=None, s_thresh=0):
     hsv = cv2.cvtColor(foreground_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    if slide_is_red:
-        # selected_ranges: [(hmin,hmax), (smin,smax), (vmin,vmax)]
-        (hmin, hmax), (smin, smax), (vmin, vmax) = selected_ranges
+    # decide selected_ranges format
+    if len(selected_ranges) == 3:
+        # format: [(hmin,hmax), (smin,smax), (vmin,vmax)]
+        hmin, hmax = selected_ranges[0]
+        smin, smax = selected_ranges[1]
+        vmin, vmax = selected_ranges[2]
         mask = (
             (h >= hmin) & (h <= hmax) &
             (s >= smin) & (s <= smax) &
             (v >= vmin) & (v <= vmax)
         )
-    else:
-        # selected_ranges: [(hmin1,hmax1), (hmin2,hmax2)]
+    elif len(selected_ranges) == 2:
         valid_saturation = s > s_thresh
         mask = np.zeros_like(h, dtype=bool)
         for (hmin, hmax) in selected_ranges:
             mask |= (h >= hmin) & (h <= hmax)
         mask &= valid_saturation
+    else:
+        raise ValueError("selected_ranges format not recognized.")
 
     return mask
 
 
-def load_image(image_path):
-    image = cv2.imread(image_path)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    return image, gray
-
-def get_otsu_mask(original_img,gray_img):
-    threshold = filters.threshold_otsu(gray_img)
-    mask = gray_img < threshold
-
-    
-    foreground = original_img.copy()
-    if mask.shape != original_img.shape[:2]:
-        raise ValueError("Mask and image shape mismatch at Otsu")
-    foreground[~mask] = 255
-    mask = (gray_img < threshold).astype(np.uint8)
-    # plt.figure(figsize=(10, 4))
-    # plt.imshow(mask, cmap='gray')
-    # plt.title("Otsu Mask")
-    # plt.axis('off')
-    # plt.show()
-
-    return mask, foreground
 
 def mass_for_contour(foreground_mask):
     closed_tissue_mask = binary_closing(foreground_mask, footprint=disk(10))
@@ -228,22 +270,7 @@ def mass_for_contour(foreground_mask):
     # plt.imshow(mass_mask,cmap='gray')
     return mass_mask
 
-def red_pixel_ratio_bgr(bgr_image, s_thresh=50, v_thresh=50):
-    """ """
-    import cv2
-    import numpy as np
 
-    hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-
-    
-    
-    red_mask = (((h <= 20) | (h >= 160)) &
-                (s >= s_thresh) &
-                (v >= v_thresh))
-
-    red_ratio = np.sum(red_mask) / red_mask.size
-    return red_ratio
 
 def hue_kmeans_visualize(foreground, cluster):
     """ """
