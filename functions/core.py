@@ -139,10 +139,11 @@ def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.001, sp
             h_sel, s_sel, v_sel = hue_ds[mask_selected], s_ds[mask_selected], v_ds[mask_selected]
 
             first_range = [
-                (int(h_sel.min()), int(h_sel.max())),
-                (int(s_sel.min()), int(s_sel.max())),
-                (int(v_sel.min()), int(v_sel.max()))
+                (int(np.percentile(h_sel, 1)), int(np.percentile(h_sel, 100))),
+                (int(np.percentile(s_sel, 1)), int(np.percentile(s_sel, 100))),
+                (int(np.percentile(v_sel, 1)), int(np.percentile(v_sel, 100)))
             ]
+
 
             print(f"🔍 Step 1: S center = {s_center:.1f}, entering second round clustering.")
             hsv_selected = np.stack([h_sel, s_sel, v_sel], axis=1)
@@ -174,9 +175,10 @@ def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.001, sp
                 s_sel = group[:, 1]
                 v_sel = group[:, 2]
 
-                hmin, hmax = int(h_sel.min()), int(h_sel.max())
-                smin, smax = int(s_sel.min()), int(s_sel.max())
-                vmin, vmax = int(v_sel.min()), int(v_sel.max())
+                hmin, hmax = int(np.percentile(h_sel, 1)), int(np.percentile(h_sel, 100))
+                smin, smax = int(np.percentile(s_sel, 1)), int(np.percentile(s_sel, 100))
+                vmin, vmax = int(np.percentile(v_sel, 1)), int(np.percentile(v_sel, 100))
+
 
                 selected_ranges = [(hmin, hmax), (smin, smax), (vmin, vmax)]
                 print(selected_ranges)
@@ -187,7 +189,7 @@ def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.001, sp
             k = 5  # fallback
             yellow_ratio = 1  # force fallback
 
-    # k == 5 or fallback
+    # k == 5 或 fallback
     kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
     hue_labels = kmeans.fit_predict(hue_ds.reshape(-1, 1))
     cluster_centers = kmeans.cluster_centers_.flatten()
@@ -233,29 +235,25 @@ def extract_global_hue_range_with_spread(tile_folder, max_sample_ratio=0.001, sp
 
     
     
-def generate_collagen_mask_direct_robust(foreground_bgr, selected_ranges, slide_is_red=None, s_thresh=0):
+def generate_collagen_mask_direct_robust(foreground_bgr, selected_ranges, slide_is_red, s_thresh=0):
     hsv = cv2.cvtColor(foreground_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    # decide selected_ranges format
-    if len(selected_ranges) == 3:
-        # format: [(hmin,hmax), (smin,smax), (vmin,vmax)]
-        hmin, hmax = selected_ranges[0]
-        smin, smax = selected_ranges[1]
-        vmin, vmax = selected_ranges[2]
+    if slide_is_red:
+        # selected_ranges: [(hmin,hmax), (smin,smax), (vmin,vmax)]
+        (hmin, hmax), (smin, smax), (vmin, vmax) = selected_ranges
         mask = (
             (h >= hmin) & (h <= hmax) &
             (s >= smin) & (s <= smax) &
             (v >= vmin) & (v <= vmax)
         )
-    elif len(selected_ranges) == 2:
+    else:
+        # selected_ranges: [(hmin1,hmax1), (hmin2,hmax2)]
         valid_saturation = s > s_thresh
         mask = np.zeros_like(h, dtype=bool)
         for (hmin, hmax) in selected_ranges:
             mask |= (h >= hmin) & (h <= hmax)
         mask &= valid_saturation
-    else:
-        raise ValueError("selected_ranges format not recognized.")
 
     return mask
 
@@ -412,9 +410,9 @@ def extract_basic_collagen_features(mass_mask, collagen_mask, pixel_per_micron=4
     collagen_pct = (collagen_area / tissue_area * 100) if tissue_area > 0 else 0
 
     data = {
-        "Tissue Area (μm²)": [round(tissue_area, 2)],
-        "Collagen Area (μm²)": [round(collagen_area, 2)],
-        "Collagen %": [round(collagen_pct, 2)]
+        "Tissue Area (μm²)": round(tissue_area, 2),
+        "Collagen Area (μm²)": round(collagen_area, 2),
+        "Collagen %": round(collagen_pct, 2)
     }
 
     return pd.DataFrame(data)
