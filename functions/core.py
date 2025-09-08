@@ -257,7 +257,26 @@ def generate_collagen_mask_direct_robust(foreground_bgr, selected_ranges, slide_
 
     return mask
 
+def get_cleaned_mask(mask, min_area=100, max_circularity=0.1):
+    mask = (mask > 0).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cleaned_mask = np.zeros_like(mask)
 
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        perimeter = cv2.arcLength(cnt, True)
+
+        if perimeter == 0:
+            continue
+
+        circularity = 4 * np.pi * area / (perimeter ** 2)
+
+        if area >= min_area and circularity < max_circularity:
+            single_mask = np.zeros_like(mask)
+            cv2.drawContours(single_mask, [cnt], -1, 255, -1)
+            cleaned_mask = cv2.bitwise_or(cleaned_mask, cv2.bitwise_and(mask, single_mask))
+
+    return cleaned_mask
 
 
 def mass_for_contour(foreground_mask):
