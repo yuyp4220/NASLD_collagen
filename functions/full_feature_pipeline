@@ -1,0 +1,581 @@
+def predict_portal_mask(hole_mask, original_image, model_path):
+    import joblib
+    import numpy as np
+    import pandas as pd
+    from skimage.measure import label, regionprops
+    from skimage.color import rgb2hsv
+    from skimage.morphology import binary_dilation
+    from skimage.measure import regionprops
+
+    # 載入訓練好的分類器
+    clf = joblib.load(model_path)
+
+    # 定義與訓練模型一致的特徵名稱順序
+    feature_names = [
+        "area", "eccentricity", "solidity", "perimeter", "boundary_density",
+        "mean_r", "mean_g", "mean_b", "mean_h", "mean_s", "mean_v",
+        "ring_mean_r", "ring_mean_g", "ring_mean_b", "ring_mean_h", "ring_mean_s", "ring_mean_v"
+    ]
+
+    # Label 孔洞區域
+    labeled_mask, _ = label(hole_mask, return_num=True)
+    props = regionprops(labeled_mask)
+    portal_mask = np.zeros_like(hole_mask, dtype=bool)
+
+    for region in props:
+        # === 幾何特徵 ===
+        area = region.area
+        eccentricity = region.eccentricity
+        solidity = region.solidity
+        perimeter = region.perimeter
+        boundary_density = perimeter / area if area > 0 else 0
+
+        # === 擷取該 region 的影像片段與 mask
+        minr, minc, maxr, maxc = region.bbox
+        cropped_img = original_image[minr:maxr, minc:maxc]
+        relative_coords = np.array([[r[0] - minr, r[1] - minc] for r in region.coords])
+        mask = np.zeros(cropped_img.shape[:2], dtype=bool)
+        mask[relative_coords[:, 0], relative_coords[:, 1]] = True
+
+        # === RGB/HSV 特徵
+        r_vals = cropped_img[:, :, 0][mask]
+        g_vals = cropped_img[:, :, 1][mask]
+        b_vals = cropped_img[:, :, 2][mask]
+        mean_r = np.mean(r_vals)
+        mean_g = np.mean(g_vals)
+        mean_b = np.mean(b_vals)
+
+        hsv_img = rgb2hsv(cropped_img / 255.0)
+        h_vals = hsv_img[:, :, 0][mask]
+        s_vals = hsv_img[:, :, 1][mask]
+        v_vals = hsv_img[:, :, 2][mask]
+        mean_h = np.mean(h_vals)
+        mean_s = np.mean(s_vals)
+        mean_v = np.mean(v_vals)
+
+        # === Ring（外圈）特徵
+        ring_width = 20
+        dilated = binary_dilation(mask, np.ones((2 * ring_width + 1, 2 * ring_width + 1)))
+        ring_mask = dilated & ~mask
+
+        if np.any(ring_mask):
+            ring_mean_r = np.mean(cropped_img[:, :, 0][ring_mask])
+            ring_mean_g = np.mean(cropped_img[:, :, 1][ring_mask])
+            ring_mean_b = np.mean(cropped_img[:, :, 2][ring_mask])
+            ring_mean_h = np.mean(hsv_img[:, :, 0][ring_mask])
+            ring_mean_s = np.mean(hsv_img[:, :, 1][ring_mask])
+            ring_mean_v = np.mean(hsv_img[:, :, 2][ring_mask])
+        else:
+            ring_mean_r = ring_mean_g = ring_mean_b = 0
+            ring_mean_h = ring_mean_s = ring_mean_v = 0
+
+        feats_dict = {
+            "area": area,
+            "eccentricity": eccentricity,
+            "solidity": solidity,
+            "perimeter": perimeter,
+            "boundary_density": boundary_density,
+            "mean_r": mean_r, "mean_g": mean_g, "mean_b": mean_b,
+            "mean_h": mean_h, "mean_s": mean_s, "mean_v": mean_v,
+            "ring_mean_r": ring_mean_r, "ring_mean_g": ring_mean_g, "ring_mean_b": ring_mean_b,
+            "ring_mean_h": ring_mean_h, "ring_mean_s": ring_mean_s, "ring_mean_v": ring_mean_v
+        }
+
+        df = pd.DataFrame([feats_dict])[feature_names]
+        pred = clf.predict(df)[0]
+
+        if pred == 1:
+            portal_mask[labeled_mask == region.label] = True
+
+    return portal_mask
+
+
+def extract_projected_collagen(
+    portal_mask: np.ndarray,
+    collagen_mask: np.ndarray,
+    pixel_size: float = 0.24,    # µm
+    step_um: float = 2           # 每步膨胀距离 µm
+):
+    import numpy as np
+    from skimage.measure import label, regionprops
+    from scipy.ndimage import binary_dilation
+
+    labeled, _ = label(portal_mask, return_num=True)
+    per_portal_masks = []
+
+    for region in regionprops(labeled):
+        orig = (labeled == region.label)
+
+        # ✅ 使用 1.5 倍 major axis 作為最大半徑
+        major_axis_um = region.major_axis_length * pixel_size
+        radius_um = major_axis_um * 1.5
+        max_steps = int(round(radius_um / pixel_size))
+        step_pixels = max(1, int(round(step_um / pixel_size)))
+
+        densities = []
+        rings = []
+        prev = orig
+
+        for r in range(step_pixels, max_steps + 1, step_pixels):
+            dil = binary_dilation(orig, iterations=r)
+            ring = dil & ~prev
+            prev = dil
+
+            rings.append(ring)
+            area_ring = ring.sum()
+            densities.append(
+                (collagen_mask & ring).sum() / area_ring if area_ring else 0
+            )
+
+        if not densities:
+            continue
+
+        peak = densities[0]  # ✅ 第一圈即視為 peak
+        if peak == 0:
+            continue
+
+        cutoff = max(i for i, d in enumerate(densities) if d >= 0.5 * peak)
+
+        combined = np.zeros_like(collagen_mask, dtype=bool)
+        for i in range(cutoff + 1):
+            combined |= rings[i]
+
+        projected = combined & collagen_mask
+        per_portal_masks.append(projected)
+
+    if per_portal_masks:
+        final_projected_mask = np.logical_or.reduce(per_portal_masks)
+    else:
+        final_projected_mask = np.zeros_like(collagen_mask, dtype=bool)
+
+    return final_projected_mask, per_portal_masks
+def split_components_by_length(
+    collagen_mask: np.ndarray,
+    cutoff_length: float
+):
+   
+    lbl = label(collagen_mask)
+    props = regionprops(lbl)
+    long_region_mask  = np.zeros_like(collagen_mask, dtype=bool)
+    short_region_mask = np.zeros_like(collagen_mask, dtype=bool)
+
+    for reg in props:
+        coords = reg.coords
+        if reg.major_axis_length >= cutoff_length:
+            long_region_mask[coords[:,0], coords[:,1]] = True
+        else:
+            short_region_mask[coords[:,0], coords[:,1]] = True
+
+    return long_region_mask, short_region_mask
+
+def compute_residual_mask(
+    long_region_mask: np.ndarray,
+    portal_mask: np.ndarray
+):
+    return long_region_mask & ~portal_mask
+
+def extract_skeleton_props(
+    residual_mask: np.ndarray,
+    collagen_mask: np.ndarray
+) -> list:
+
+    skel = skeletonize(residual_mask)
+    skel_lbl = label(skel)
+    props = regionprops(skel_lbl)
+    comp_lbl = label(collagen_mask)
+
+    skel_info = []
+    for prop in props:
+        coords = prop.coords
+        ys, xs = coords[:,0], coords[:,1]
+        labels = comp_lbl[ys, xs]
+        labels = labels[labels > 0]
+        if labels.size == 0:
+            continue
+        comp_id   = Counter(labels).most_common(1)[0][0]
+        full_mask = (comp_lbl == comp_id)
+        ori_deg   = (np.degrees(prop.orientation) + 180) % 180
+        skel_info.append({
+            'skel_coords':    coords,     # skeleton 在 residual 上的坐标
+            'orientation':    ori_deg,    # 该骨架的主方向
+            'component_mask': full_mask   # 对应完整组件掩码
+        })
+    return skel_info
+
+def extract_dominant_angles(
+    skel_info: list,
+    bin_size: float = 5.0,
+    threshold_ratio: float = 0.2
+) -> list:
+    """
+    从 skeleton props 列表中提取主方向峰值。
+    """
+    orientations = np.array([info['orientation'] for info in skel_info])
+    nbins = int(180 / bin_size)
+    hist, edges = np.histogram(orientations, bins=nbins, range=(0,180))
+    peaks, _ = find_peaks(hist)
+    max_h = hist.max() if hist.size else 0
+    return [
+        (edges[i] + edges[i+1]) / 2
+        for i in peaks
+        if hist[i] >= threshold_ratio * max_h
+    ]
+
+def classify_components_by_direction(
+    skel_info: list,
+    dominant_angles: list,
+    residual_mask: np.ndarray,
+    portal_mask: np.ndarray,
+    short_region_mask: np.ndarray,
+    angle_threshold: float = 15.0
+) -> (np.ndarray, np.ndarray):
+    """
+    将骨架组件和短组件按方向分类为 septal / fibrillar，
+    只用骨架在 residual_mask 上的部分去判断方向，
+    并确保不包含 portal 区域。
+
+    Args:
+        skel_info:        List[dict]，每项含：
+                            'skel_coords', 'orientation', 'component_mask'
+        dominant_angles:  List[float]，主方向峰值
+        residual_mask:    bool 2D，residual 掩码（long & ~portal）
+        portal_mask:      bool 2D，portal 掩码
+        short_region_mask:bool 2D，短组件并集（直接归 fibrillar）
+        angle_threshold:  float，方向容差（度）
+
+    Returns:
+        septal_mask:      bool 2D，septal 类残余组件区域
+        fibrillar_mask:   bool 2D，fibrillar 类残余+短组件区域
+    """
+    # 初始化
+    shape = residual_mask.shape
+    septal_mask    = np.zeros(shape, dtype=bool)
+    fibrillar_mask = np.zeros(shape, dtype=bool)
+
+    # 1) 长组件分类：只用骨架在 residual_mask 上的部分
+    for info in skel_info:
+        # 该骨架在 residual 上的像素
+        ys, xs = info['skel_coords'][:,0], info['skel_coords'][:,1]
+        mask_in_residual = residual_mask[ys, xs]
+        if not mask_in_residual.any():
+            continue
+
+        ori = info['orientation']
+        # 找到与主峰最小差值
+        if dominant_angles:
+            diffs = np.abs(ori - np.array(dominant_angles))
+            diffs = np.minimum(diffs, 180 - diffs)
+            is_septal = diffs.min() <= angle_threshold
+        else:
+            is_septal = False
+
+        # 只把**残余部分**的组件投射回去
+        comp_mask = info['component_mask'] & residual_mask
+        if is_septal:
+            septal_mask    |= comp_mask
+        else:
+            fibrillar_mask |= comp_mask
+
+    # 2) 短组件全部归 fibrillar
+    fibrillar_mask |= short_region_mask
+
+    # 3) 剔除 portal 区域，确保各自不包含 portal
+    septal_mask    &= ~portal_mask
+    fibrillar_mask &= ~portal_mask
+    fibrillar_mask &= ~septal_mask
+
+    return septal_mask, fibrillar_mask
+
+def classify_aggregate_disperse_strict(
+    collagen_mask: np.ndarray,
+    long_region_mask: np.ndarray,
+    short_region_mask: np.ndarray,
+    crosslink_threshold: int = 3
+) -> (np.ndarray, np.ndarray):
+    """
+    按照指定思路分類 collagen_mask 成 aggregated 和 disperse：
+    - 只分析 long_region_mask 部分骨架；
+    - 分叉點數 >= threshold 的組件歸 aggregated；否則歸 disperse；
+    - short_region_mask 全部歸 disperse；
+    - 最後確保兩者互不重疊。
+
+    Args:
+        collagen_mask:      bool 2D，整張膠原掩碼
+        long_region_mask:   bool 2D，長組件掩碼
+        short_region_mask:  bool 2D，短組件掩碼
+        crosslink_threshold: int，分叉點數門檻
+
+    Returns:
+        aggregated_mask:    bool 2D，聚集型膠原掩碼
+        disperse_mask:      bool 2D，離散型膠原掩碼
+    """
+    # 1. 對長組件部分骨架化
+    skel = skeletonize(long_region_mask)
+    skel_lbl = label(skel)
+    props = regionprops(skel_lbl)
+
+    comp_lbl = label(collagen_mask)
+
+    # 初始化結果
+    aggregated_mask = np.zeros_like(collagen_mask, dtype=bool)
+    disperse_mask   = np.zeros_like(collagen_mask, dtype=bool)
+
+    # 鄰居卷積核用於分叉點計算
+    neigh_kernel = np.array([[1,1,1],
+                             [1,0,1],
+                             [1,1,1]], dtype=int)
+
+    # 2. 遍歷每個骨架分量
+    for prop in props:
+        # 局部骨架圖像
+        local = prop.image.astype(int)
+        branch_count = int((convolve(local, neigh_kernel, mode='constant', cval=0) >= 3).sum())
+
+        # 對應回 collagen_mask 的完整 component
+        ys, xs = prop.coords[:,0], prop.coords[:,1]
+        labels = comp_lbl[ys, xs]
+        labels = labels[labels > 0]
+        if labels.size == 0:
+            continue
+        comp_id = Counter(labels).most_common(1)[0][0]
+        comp_mask = (comp_lbl == comp_id)
+
+        # 根據分叉點分類
+        if branch_count >= crosslink_threshold:
+            aggregated_mask |= comp_mask
+        else:
+            disperse_mask |= comp_mask
+
+    # 3. 把 short region 加到 disperse
+    disperse_mask |= short_region_mask
+
+    # 4. 確保兩者互不重疊
+    disperse_mask &= ~aggregated_mask
+
+    return aggregated_mask, disperse_mask
+
+def get_params(path,hsv_ranges, slide_is_red):    
+    image, gray = load_image(path)
+    foreground_mask, foreground_image = get_otsu_mask(image,gray)
+    mass_mask = mass_for_contour(foreground_mask)
+    collagen_mask = generate_collagen_mask_direct_robust(foreground_image, hsv_ranges, slide_is_red, s_thresh=30)
+    edge_collagen_mask = get_edge_collagen(collagen_mask)
+    vis,contour_mask = draw_precise_tissue_contour(mass_mask,image)
+    points = find_overlapping_points(contour_mask,edge_collagen_mask)
+    labels, unique_labels = plot_clusters_on_masks(points)
+    hull_mask = plot_convex_hulls_on_mask(edge_collagen_mask,points,labels,unique_labels)
+    closed_edge_mask = get_closed_tissue_mask(contour_mask,hull_mask,image,foreground_mask)
+    tissue_filled_mask,hole_mask = get_hole_mask(closed_edge_mask)
+
+    lumen_mask = predict_portal_mask(hole_mask,image,model_path='/Users/zacharygriffin/Desktop/KTH/weekly reports/week23/portal_classifier_2048_new.pkl')
+    portal_collagen_mask, portal_masks = extract_projected_collagen(lumen_mask,collagen_mask)
+
+    long_region_mask, short_region_mask = split_components_by_length(collagen_mask,40)
+    residual_mask = compute_residual_mask(long_region_mask,portal_collagen_mask)
+    skel_info = extract_skeleton_props(residual_mask, collagen_mask)
+    dominant_angles = extract_dominant_angles(skel_info, bin_size=10, threshold_ratio=0.2)
+    septal_mask, fibrillar_mask = classify_components_by_direction(skel_info,dominant_angles,residual_mask,portal_collagen_mask,short_region_mask,15)
+    aggregated_mask, disperse_mask = classify_aggregate_disperse_strict(collagen_mask, long_region_mask, short_region_mask, crosslink_threshold=1)
+
+    params = {
+    'mass_mask': tissue_filled_mask,
+    'collagen_mask': collagen_mask,
+    'region_masks': {
+        "Portal": portal_collagen_mask,
+        "Septal": septal_mask,
+        "Fibrillar": fibrillar_mask
+    },
+    'subtype_masks': {
+        "Aggregated": aggregated_mask,
+        "Dispersed": disperse_mask
+    },
+    'portal_structure_mask': lumen_mask,
+    'pixel_per_micron': 4.1667}
+   
+    
+    return params
+
+
+def finalize_with_portal_structure_full_final():
+    import numpy as np
+    import pandas as pd
+    from skimage.measure import label, regionprops
+    from skimage.morphology import skeletonize
+    from scipy.ndimage import convolve
+
+    def export_features():
+        def count_crosslinks(binary_mask):
+            skeleton = skeletonize(binary_mask)
+            kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]])
+            neighbor_count = convolve(skeleton.astype(np.uint8), kernel, mode='constant', cval=0)
+            crosslink_points = (skeleton & (neighbor_count >= 3))
+            return int(np.sum(crosslink_points))
+
+        def format_float(val):
+            return round(val, 2) if isinstance(val, (float, int)) else val
+
+        def format_count(val):
+            return int(val) if isinstance(val, (int, float)) else val
+
+        def description_text_with_unit(feat, region, subtype):
+            region_map = {"Portal": "Portal", "Septal": "Septal", "Fibrillar": "Fibrillar"}
+            subtype_map = {"Aggregated": "Aggregated", "Dispersed": "Dispersed"}
+            region_txt = region_map.get(region, region) if region else "Overall"
+            subtype_txt = subtype_map.get(subtype, "") if subtype else ""
+            joint = f"{region_txt} & {subtype_txt}" if region and subtype else region_txt
+            unit_map = {
+                "Total Collagen Area": "(μm²)",
+                "Length": "(μm)",
+                "Width": "(μm)",
+                "CollagenPct": "(%)"
+            }
+            unit = unit_map.get(feat.replace("String ", ""), "")
+            return f"{feat} {unit} ({joint})"
+
+        def extract_features_table(mass_mask, collagen_mask, region_masks, subtype_masks,
+                                   portal_structure_mask=None, pixel_per_micron=4.1667):
+            assert mass_mask.shape == collagen_mask.shape
+            for m in list(region_masks.values()) + list(subtype_masks.values()):
+                assert m.shape == mass_mask.shape
+            if portal_structure_mask is not None:
+                assert portal_structure_mask.shape == mass_mask.shape
+
+            all_rows = []
+            row_id = 1
+            pixel_area_to_micron2 = (1 / pixel_per_micron) ** 2
+
+            def add_row(desc, mean="", median="", max_="", count=""):
+                nonlocal row_id
+                all_rows.append({
+                    "NO.": row_id,
+                    "Description": desc,
+                    "mean": format_float(mean),
+                    "median": format_float(median),
+                    "max": format_float(max_),
+                    "count": format_count(count)
+                })
+                row_id += 1
+
+            def add_pct_first(collagen_mask_part, mass_mask_part, region, subtype):
+                numerator = np.sum(collagen_mask_part)
+                denominator = np.sum(mass_mask_part)
+                pct = (numerator / denominator) * 100 if denominator > 0 else 0.0
+                desc = description_text_with_unit("CollagenPct", region, subtype)
+                add_row(desc, mean=pct)
+
+            tissue_pct = (np.sum(mass_mask > 0) / mass_mask.size) * 100
+            add_row("Tissue percentage in tile (%)", mean=tissue_pct)
+
+            tissue_area = np.sum(mass_mask > 0) * pixel_area_to_micron2
+            add_row("Total Tissue Area (μm²)", mean=tissue_area)
+
+            if portal_structure_mask is not None:
+                label_img = label(portal_structure_mask.astype(np.uint8))
+                regions = regionprops(label_img)
+                portal_count = sum(1 for r in regions if r.area >= 100)
+                add_row("Number of Portal Regions", count=portal_count)
+
+            add_pct_first(collagen_mask, mass_mask, None, None)
+
+            props = regionprops(label(collagen_mask.astype(np.uint8)))
+            lengths, widths, eccs, solids, perims, orients, ratios = [], [], [], [], [], [], []
+            for p in props:
+                major = p.major_axis_length
+                minor = p.minor_axis_length
+                axis_ratio = minor / major if major > 0 else 0
+                lengths.append(major / pixel_per_micron)
+                widths.append(minor / pixel_per_micron)
+                eccs.append(p.eccentricity)
+                solids.append(p.solidity)
+                perims.append(p.perimeter / pixel_per_micron)
+                orients.append(p.orientation)
+                ratios.append(axis_ratio)
+
+            for feat, values in zip(
+                ["String Length", "String Width", "Eccentricity", "Solidity", "Perimeter", "Orientation"],
+                [lengths, widths, eccs, solids, perims, orients]
+            ):
+                if values:
+                    add_row(description_text_with_unit(feat, None, None), np.mean(values), np.median(values), np.max(values))
+
+            add_row(description_text_with_unit("NoStr", None, None), count=len(lengths))
+            add_row(description_text_with_unit("NoShortStr", None, None), count=np.sum(np.array(lengths) <= 20))
+            add_row(description_text_with_unit("NoLongStr", None, None), count=np.sum(np.array(lengths) > 20))
+            add_row(description_text_with_unit("NoThinStr", None, None), count=np.sum(np.array(ratios) <= 0.25))
+            add_row(description_text_with_unit("NoThickStr", None, None), count=np.sum(np.array(ratios) > 0.25))
+            add_row(description_text_with_unit("NoCrosslinks", None, None), count=count_crosslinks(collagen_mask))
+            add_row(description_text_with_unit("Total Collagen Area", None, None), mean=np.sum((collagen_mask > 0)) * pixel_area_to_micron2)
+
+            for region_name, region_mask in region_masks.items():
+                add_pct_first(region_mask, mass_mask, region_name, None)
+                props = regionprops(label(region_mask.astype(np.uint8)))
+                lengths, widths, ratios = [], [], []
+                for p in props:
+                    major = p.major_axis_length
+                    minor = p.minor_axis_length
+                    axis_ratio = minor / major if major > 0 else 0
+                    lengths.append(major / pixel_per_micron)
+                    widths.append(minor / pixel_per_micron)
+                    ratios.append(axis_ratio)
+                add_row(description_text_with_unit("NoStr", region_name, None), count=len(lengths))
+                add_row(description_text_with_unit("NoShortStr", region_name, None), count=np.sum(np.array(lengths) <= 20))
+                add_row(description_text_with_unit("NoLongStr", region_name, None), count=np.sum(np.array(lengths) > 20))
+                add_row(description_text_with_unit("NoThinStr", region_name, None), count=np.sum(np.array(ratios) <= 0.25))
+                add_row(description_text_with_unit("NoThickStr", region_name, None), count=np.sum(np.array(ratios) > 0.25))
+                add_row(description_text_with_unit("NoCrosslinks", region_name, None), count=count_crosslinks(region_mask))
+                add_row(description_text_with_unit("String Length", region_name, None), mean=np.mean(lengths))
+                add_row(description_text_with_unit("String Width", region_name, None), mean=np.mean(widths))
+                add_row(description_text_with_unit("Total Collagen Area", region_name, None), mean=np.sum(region_mask) * pixel_area_to_micron2)
+
+            recorded_keys = set()
+            for region_name, region_mask in region_masks.items():
+                for subtype_name, subtype_mask in subtype_masks.items():
+                    key = (region_name, subtype_name)
+                    combo_mask = (region_mask > 0) & (subtype_mask > 0)
+                    if np.sum(combo_mask) == 0:
+                        continue
+                    recorded_keys.add(key)
+                    add_pct_first(combo_mask, mass_mask, region_name, subtype_name)
+                    props = regionprops(label(combo_mask.astype(np.uint8)))
+                    lengths, widths, ratios = [], [], []
+                    for p in props:
+                        major = p.major_axis_length
+                        minor = p.minor_axis_length
+                        axis_ratio = minor / major if major > 0 else 0
+                        lengths.append(major / pixel_per_micron)
+                        widths.append(minor / pixel_per_micron)
+                        ratios.append(axis_ratio)
+                    add_row(description_text_with_unit("NoStr", region_name, subtype_name), count=len(lengths))
+                    add_row(description_text_with_unit("NoShortStr", region_name, subtype_name), count=np.sum(np.array(lengths) <= 20))
+                    add_row(description_text_with_unit("NoLongStr", region_name, subtype_name), count=np.sum(np.array(lengths) > 20))
+                    add_row(description_text_with_unit("NoThinStr", region_name, subtype_name), count=np.sum(np.array(ratios) <= 0.25))
+                    add_row(description_text_with_unit("NoThickStr", region_name, subtype_name), count=np.sum(np.array(ratios) > 0.25))
+                    add_row(description_text_with_unit("NoCrosslinks", region_name, subtype_name), count=count_crosslinks(combo_mask))
+                    add_row(description_text_with_unit("String Length", region_name, subtype_name), np.mean(lengths), np.median(lengths), np.max(lengths))
+                    add_row(description_text_with_unit("String Width", region_name, subtype_name), np.mean(widths), np.median(widths), np.max(widths))
+                    add_row(description_text_with_unit("Total Collagen Area", region_name, subtype_name), mean=np.sum(combo_mask) * pixel_area_to_micron2)
+
+            region_names = ["Portal", "Septal", "Fibrillar"]
+            subtype_names = ["Aggregated", "Dispersed"]
+            features_to_add = [
+                "CollagenPct", "NoStr", "NoShortStr", "NoLongStr", "NoThinStr",
+                "NoThickStr", "NoCrosslinks", "String Length", "String Width", "Total Collagen Area"
+            ]
+            for region in region_names:
+                for subtype in subtype_names:
+                    if (region, subtype) in recorded_keys:
+                        continue
+                    for feat in features_to_add:
+                        desc = description_text_with_unit(feat, region, subtype)
+                        add_row(desc, mean=0, median=0, max_=0, count=0)
+
+            df = pd.DataFrame(all_rows)
+            return df, df.to_dict(orient="records")
+
+        return extract_features_table
+
+    return export_features()
+
+
+    
+ 
