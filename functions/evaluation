@@ -1,0 +1,339 @@
+-----------------------------------------------------  Boxplot  -----------------------------------------------------  
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.stats import zscore
+
+df_B = pd.read_excel('feature_table')
+
+# === params setting ===
+# F0-4 -> 0-4
+df_B['Stage_num'] = df_B['Stage'].astype(str).str.extract('(\d+)').astype(int)
+stage_col = 'Stage_num'
+
+feature_col = 'CollagenPct (%) (Overall)'
+z_thresh = 2  
+
+# === 1. （Boxplot & Violin） ===
+plt.figure(figsize=(8, 4))
+sns.boxplot(x=stage_col, y=feature_col, data=df_B, color="lightblue")
+sns.stripplot(x=stage_col, y=feature_col, data=df_B, color="black", alpha=0.5)
+plt.title(f"{feature_col} by {stage_col}")
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8, 4))
+sns.violinplot(x=stage_col, y=feature_col, data=df_B, inner="box", color="lightgray")
+plt.title(f"Distribution of {feature_col} by {stage_col}")
+plt.tight_layout()
+plt.show()
+
+# === 2. Stage satistics ===
+summary = df_B.groupby(stage_col)[feature_col].agg(
+    ['count', 'mean', 'median', 'std', 'min', 'max',
+     (lambda x: np.percentile(x, 25)),
+     (lambda x: np.percentile(x, 75)),
+     (lambda x: np.percentile(x, 5)),
+     (lambda x: np.percentile(x, 95))]
+).round(3)
+summary.columns = ['count', 'mean', 'median', 'std', 'min', 'max',
+                   'Q1', 'Q3', 'P5', 'P95']
+
+# === 3. z-score & extreme values ===
+df_B['z'] = df_B.groupby(stage_col)[feature_col].transform(zscore)
+df_B['is_outlier'] = df_B['z'].abs() > z_thresh
+
+outlier_ratio = df_B.groupby(stage_col)['is_outlier'].mean().round(3)
+summary['outlier_ratio'] = outlier_ratio
+
+# === 4. Stage overlap ===
+def overlap(a, b):
+    a_range = (np.percentile(a, 5), np.percentile(a, 95))
+    b_range = (np.percentile(b, 5), np.percentile(b, 95))
+    left = max(a_range[0], b_range[0])
+    right = min(a_range[1], b_range[1])
+    return max(0, right - left) / (max(a_range[1], b_range[1]) - min(a_range[0], b_range[0]))
+
+stages = sorted(df_B[stage_col].unique())
+overlap_pairs = {}
+for i in range(len(stages) - 1):
+    s1, s2 = stages[i], stages[i + 1]
+    o = overlap(df_B[df_B[stage_col] == s1][feature_col],
+                df_B[df_B[stage_col] == s2][feature_col])
+    overlap_pairs[f"{s1}-{s2}"] = round(o, 3)
+
+overlap_df = pd.DataFrame.from_dict(overlap_pairs, orient='index', columns=['overlap_5_95'])
+summary = summary.merge(outlier_ratio, left_index=True, right_index=True, suffixes=('', '_dup'))
+
+print("\n=== Stage satistics ===")
+print(summary)
+print("\n=== adjancent stages overlap（p5-p95） ===")
+print(overlap_df)
+
+-----------------------------------------------------  XGBoost model  -----------------------------------------------------  
+
+
+import os
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix
+from xgboost import XGBClassifier
+
+
+def build_slide_level_dataset(root_dir):
+    root_path = Path(root_dir)
+    stage_paths = [p for p in root_path.iterdir() if p.is_dir()]
+    print(f"📁 Found {len(stage_paths)} stage folders under {root_dir}")
+
+    slide_records = []
+
+    for stage_path in stage_paths:
+        stage = stage_path.name
+        slide_folders = [p for p in stage_path.iterdir() if p.is_dir()]
+        print(f"  └── {stage}: {len(slide_folders)} slides")
+
+        for slide_folder in tqdm(slide_folders, desc=f"Processing {stage}", leave=False):
+            slide_id = slide_folder.name
+            json_files = list(slide_folder.glob("*.json"))
+            if not json_files:
+                continue
+
+            tile_list = []
+            for jf in json_files:
+                try:
+                    with open(jf, "r") as f:
+                        data = json.load(f)
+
+                    feats = {}
+                    if isinstance(data, list):
+                        for item in data:
+                            if not isinstance(item, dict):
+                                continue
+                            desc = item.get("Description", "").strip()
+                            val = item.get("mean") or item.get("count")
+                            try:
+                                val = float(val)
+                            except (TypeError, ValueError):
+                                val = np.nan
+                            if desc != "" and not pd.isna(val):
+                                feats[desc] = val
+                    elif isinstance(data, dict):
+                        feats = data.get("features", {})
+                    else:
+                        feats = {}
+
+                    if feats:
+                        tile_list.append(feats)
+                except Exception as e:
+                    print(f"⚠️ Error reading {jf}: {e}")
+                    continue
+
+            if not tile_list:
+                continue
+
+            tile_df = pd.DataFrame(tile_list)
+
+            # slide-level 统计（仅数值列）
+            def safe_percentile(x, q):
+                x = x.dropna()
+                if len(x) == 0:
+                    return np.nan
+                return np.percentile(x, q)
+
+            numeric_df = tile_df.select_dtypes(include=[np.number])
+            if numeric_df.empty:
+                continue
+
+            slide_stats = numeric_df.agg(['mean', 'std', lambda x: safe_percentile(x, 95)]).T
+            slide_stats.columns = ['mean', 'std', 'p95']
+
+            cpa_col = "CollagenPct (%) (Overall)"
+            if cpa_col in tile_df.columns:
+                median_val = tile_df[cpa_col].median()
+                high_ratio = np.mean(tile_df[cpa_col] > 1.5 * median_val)
+            else:
+                high_ratio = np.nan
+
+            row = {f"{feat}_{stat}": slide_stats.loc[feat, stat]
+                   for feat in slide_stats.index
+                   for stat in ['mean', 'std', 'p95']}
+            row["High_CPA_Ratio"] = high_ratio
+            row["ID"] = slide_id
+            row["Stage"] = stage
+            slide_records.append(row)
+
+    if not slide_records:
+        raise ValueError("🚫 No valid slide records found. Check folder names or JSON structure.")
+
+    df_slide = pd.DataFrame(slide_records)
+    df_slide['Stage_num'] = df_slide['Stage'].astype(str).str.extract('(\d+)')[0].astype(float)
+    print(f"\n✅ Combined {len(df_slide)} slides × {df_slide.shape[1]} features.")
+    return df_slide
+
+-----------------------------------------------------  Cross Validation  -----------------------------------------------------  
+
+def train_xgb_cv(df_slide, show_cm=True):
+    X = df_slide.drop(columns=['ID', 'Stage', 'Stage_num']).fillna(0)
+    y = df_slide['Stage_num'].astype(int)
+
+    # remove constance
+    nunique = X.nunique()
+    const_cols = nunique[nunique <= 1].index
+    if len(const_cols) > 0:
+        print(f"⚠️ Removing {len(const_cols)} constant features")
+        X = X.drop(columns=const_cols)
+
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    accs, kappas = [], []
+    all_cm = None  
+
+    labels = sorted(df_slide['Stage_num'].unique())
+
+    for fold, (tr_idx, va_idx) in enumerate(kf.split(X, y), 1):
+        X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
+        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+
+        model = XGBClassifier(
+            n_estimators=400,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            eval_metric='mlogloss'
+        )
+        model.fit(X_tr, y_tr)
+        pred = model.predict(X_va)
+
+        acc = accuracy_score(y_va, pred)
+        kappa = cohen_kappa_score(y_va, pred, weights='quadratic')
+        accs.append(acc)
+        kappas.append(kappa)
+
+        cm = confusion_matrix(y_va, pred, labels=labels, normalize='true')
+        if all_cm is None:
+            all_cm = cm
+        else:
+            all_cm += cm  
+
+        print(f"Fold {fold}: Accuracy={acc:.3f}, QWKappa={kappa:.3f}")
+
+    # ===== avg result =====
+    avg_acc, avg_kappa = np.mean(accs), np.mean(kappas)
+    print(f"\n📊 Overall 5-Fold CV:")
+    print(f"Accuracy = {avg_acc:.3f} ± {np.std(accs):.3f}")
+    print(f"Quadratic Weighted Kappa = {avg_kappa:.3f} ± {np.std(kappas):.3f}")
+
+    # ===== confusion matrix visualisation =====
+    if show_cm and all_cm is not None:
+        avg_cm = all_cm / len(accs)
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(avg_cm, annot=True, fmt=".2f", cmap="Blues",
+                    xticklabels=[f"Pred F{int(i)}" for i in labels],
+                    yticklabels=[f"True F{int(i)}" for i in labels])
+        plt.title("Average Normalized Confusion Matrix (5-Fold CV)")
+        plt.xlabel("Predicted")
+        plt.ylabel("True")
+        plt.tight_layout()
+        plt.show()
+
+    return avg_acc, avg_kappa
+
+    -----------------------------------------------------  Testset Valuation  -----------------------------------------------------  
+import os
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix
+from xgboost import XGBClassifier
+
+
+def train_xgb_and_test(df_train, df_test):
+    X_train = df_train.drop(columns=['ID', 'Stage', 'Stage_num']).fillna(0)
+    y_train = df_train['Stage_num']
+    X_test = df_test.drop(columns=['ID', 'Stage', 'Stage_num']).fillna(0)
+    y_test = df_test['Stage_num']
+
+    # alignment
+    X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+
+    model = XGBClassifier(
+        n_estimators=400,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        eval_metric='mlogloss'
+    )
+    model.fit(X_train, y_train)
+    pred = model.predict(X_test)
+
+    acc = accuracy_score(y_test, pred)
+    kappa = cohen_kappa_score(y_test, pred, weights='quadratic')
+
+    print(f"\n📊 Test set performance:")
+    print(f"Accuracy = {acc:.3f}")
+    print(f"Quadratic Weighted Kappa = {kappa:.3f}")
+
+    
+    labels = sorted(df_train['Stage_num'].unique())
+    cm = confusion_matrix(y_test, pred, labels=labels, normalize='true')
+
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt=".2f", cmap="Blues",
+                xticklabels=[f"Pred F{int(i)}" for i in labels],
+                yticklabels=[f"True F{int(i)}" for i in labels])
+    plt.title("Normalized Confusion Matrix (Test Set)")
+    plt.xlabel("Predicted Stage")
+    plt.ylabel("True Stage")
+    plt.tight_layout()
+    plt.show()
+
+    # Feature importance
+    importance = pd.Series(model.feature_importances_, index=X_train.columns)
+    top_feats = importance.sort_values(ascending=False).head(10)
+    plt.figure(figsize=(7,6))
+    sns.barplot(x=top_feats.values, y=top_feats.index, orient="h")
+    plt.title("Top 10 Feature Importances (XGBoost)")
+    plt.tight_layout()
+    plt.show()
+
+    return acc, kappa
+
+-----------------------------------------------------  main process  -----------------------------------------------------  
+root_dir = "jsons_folder"
+df_slide = build_slide_level_dataset(root_dir)
+df_slide.to_excel(
+    "features.xlsx",
+    index=False
+)
+print("💾 Saved slide-level features to Excel.")
+acc, kappa = train_xgb_cv(df_slide)
+
+
+if __name__ == "__main__":
+    root_dir_train = ""
+    root_dir_test = ""
+
+    df_train = build_slide_level_dataset(root_dir_train)
+    df_test = build_slide_level_dataset(root_dir_test)
+
+    df_train.to_excel("", index=False)
+    df_test.to_excel("", index=False)
+
+    print("💾 Saved both train and test features.")
+    acc, kappa = train_xgb_and_test(df_train, df_test)    
